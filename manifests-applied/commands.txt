@@ -1,0 +1,174 @@
+#Install helm
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod 700 get_helm.sh
+./get_helm.sh
+
+helm repo add kor https://yonahd.github.io/kor
+git clone https://github.com/yonahd/kor.git
+cd kor
+
+cat <<'EOF' > charts/kor/templates/kor-job.yaml
+{{- if .Values.oneTimeJob.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kor-once
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: kor
+    app.kubernetes.io/component: onetime-job
+  annotations:
+    # 🪄 Run automatically after Helm install or upgrade
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "1"
+    # 🧹 Keep Job logs for inspection; delete only before new creation
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  ttlSecondsAfterFinished: 300  # Auto-clean after 5 minutes
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kor
+        app.kubernetes.io/component: onetime-job
+    spec:
+      serviceAccountName: kor
+      restartPolicy: Never
+      containers:
+        - name: kor
+          image: yonahdissen/kor:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - all
+            - -v
+            - --show-reason
+            - --exclude-namespaces
+            - kube-system,kube-public,kor
+{{- end }}
+EOF
+
+cat <<'EOF' > charts/kor/templates/kor-rbac-patch.yaml
+{{- if .Values.extraRbac.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kor-read-all
+rules:
+  # 🧩 Core resources (cluster + namespaced)
+  - apiGroups: [""]
+    resources:
+      - pods
+      - services
+      - configmaps
+      - secrets
+      - namespaces
+      - persistentvolumes
+    verbs: ["get", "list", "watch"]
+
+  # 🧩 Workload controllers
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+      - daemonsets
+      - replicasets
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch"]
+
+  # 🧩 RBAC
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - roles
+      - rolebindings
+      - clusterroles
+      - clusterrolebindings
+    verbs: ["get", "list", "watch"]
+
+  # 🧩 Networking
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - networkpolicies
+      - ingresses
+    verbs: ["get", "list", "watch"]
+
+  # 🧩 EndpointSlices (fix for your error)
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpoints
+      - endpointslices
+    verbs: ["get", "list", "watch"]
+
+  # 🧩 Admin/baseline network policies (fix for your error)
+  - apiGroups: ["policy.networking.k8s.io"]
+    resources:
+      - adminnetworkpolicies
+      - baselineadminnetworkpolicies
+    verbs: ["get", "list", "watch"]
+
+  # 🧩 CRDs
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources:
+      - customresourcedefinitions
+    verbs: ["get", "list", "watch"]
+
+  # 🧩 Calico CRDs (and similar)
+  - apiGroups: ["crd.projectcalico.org"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+
+  # 🧩 Optional catch-all (safe but generous)
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kor-read-all-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kor-read-all
+subjects:
+  - kind: ServiceAccount
+    name: kor
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+EOF
+
+sed -i '/^$/d;$a\
+\
+extraRbac:\n  enabled: true\n\
+\noneTimeJob:\n  enabled: true' charts/kor/values.yaml
+
+
+helm upgrade -i kor ./charts/kor \
+  --namespace kor \
+  --create-namespace \
+  --set exporter.enabled=false \
+  --set cronJob.enabled=false \
+  --set extraRbac.enabled=true \
+  --set oneTimeJob.enabled=true
+
+kubectl -n kor logs job/kor-once
+
+#How to test it
+kubectl create ns kor-dummy
+kubectl -n kor-dummy create configmap unused-cm --from-literal=foo=bar
+kubectl -n kor-dummy create service clusterip unused-svc --tcp=80:80
+kubectl -n kor-dummy create service clusterip unused-svc --tcp=80:80
+kubectl -n kor-dummy create configmap unused-cm --from-literal=foo=bar
+
+kubectl -n kor logs -f job/kor-once
+
+helm upgrade kor ./charts/kor \
+  --namespace kor \
+  --reuse-values
+
+kubectl -n kor logs -f job/kor-once

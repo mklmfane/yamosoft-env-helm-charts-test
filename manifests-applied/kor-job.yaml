@@ -1,0 +1,15 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kor-once
+  namespace: kor
+spec:
+  ttlSecondsAfterFinished: 60   # auto-clean after 1 minute
+  template:
+    spec:
+      serviceAccountName: kor
+      restartPolicy: Never
+      containers:
+      - name: kor
+        image: yonahdissen/kor:latest
+        args: ["all", "-v", "--show-reason", "--exclude-namespaces", "kube-system,kube-public,kor"]
