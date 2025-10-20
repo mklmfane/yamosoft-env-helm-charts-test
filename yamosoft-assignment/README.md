@@ -1,12 +1,13 @@
 # Deploying an Application with Helm (Local Kubernetes via Vagrant + MetalLB)
 
-This README walks through creating a **simple templated Helm chart** that deploys an **NGINX** web server with an **Ingress**, configured to work on a **local Kubernetes cluster** provisioned via **Vagrant**. It also documents how MetalLB is installed and used to provide a LoadBalancer IP, plus a smoke test app to validate ingress.
+This README walks through creating a **simple templated Helm chart** that deploys an **NGINX** web server with an **Ingress**, configured to work on a **local Kubernetes cluster** provisioned via **Vagrant**. 
+It also documents how MetalLB is installed and used to provide a LoadBalancer IP, plus a smoke test app to validate ingress.
 
 ---
 
 ## 1 Prerequisites
 
-* Local Kubernetes cluster (brought up via `vagrant up` from this repo)
+* Local Kubernetes cluster (brought up via `vagrant up` from the parent frolder in this repository)
 * `kubectl` pointing at that cluster
 * `helm` v3+
 * Network `192.168.56.0/24` available (typical Vagrant host-only network)
