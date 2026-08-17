@@ -1,0 +1,36 @@
+---
+# Cluster name (used just as a label / grouping name)
+cluster_name: "Kubernetes Cluster KVM"
+
+# Fixed kubeadm token used for all nodes in this lab cluster
+# Must match pattern: 6 chars . 16 hex chars
+join_token: "abcdef.0123456789abcdef"
+
+# Optional environment variables for CRI-O/kubelet (leave empty if unused)
+environment: ""
+
+network:
+  # Worker IPs are simply incremented from the control IP.
+  control_ip: 192.168.121.10
+  dns_servers:
+    - 8.8.8.8
+    - 1.1.1.1
+  pod_cidr: 172.16.1.0/16
+  service_cidr: 172.17.1.0/18
+
+nodes:
+  control:
+    cpu: 2
+    memory: 3096
+  workers:
+    count: 2
+    cpu: 1
+    memory: 1024
+
+software:
+  box: jtarpley/ubuntu2404_base
+  box_version: 2025.11.12
+  calico: 3.30.3
+  dashboard: 2.7.0
+  kubernetes: "1.34"
+  os: xUbuntu_24.04

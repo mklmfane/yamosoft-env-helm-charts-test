@@ -1,0 +1,204 @@
+pipeline {
+  agent any
+
+  environment {
+    JAVA_HOME         = '/usr/lib/jvm/java-21-openjdk-amd64'
+    PATH              = '/usr/lib/jvm/java-21-openjdk-amd64/bin:/var/lib/jenkins/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    APP_NAME          = 'petclinic'
+    NAMESPACE         = 'petclinic'
+    REGISTRY          = 'docker.io'
+    IMAGE_REPO        = 'saragoza68/spring-petclinic'
+    IMAGE_TAG         = "${BUILD_NUMBER}"
+    IMAGE_FULL        = "${REGISTRY}/${IMAGE_REPO}:${IMAGE_TAG}"
+    MANIFEST_TEMPLATE = '/var/lib/jenkins/manifests/petclinic.yaml'
+    RENDERED_FILE     = 'k8s/petclinic-rendered.yaml'
+    KUBECTL           = '/var/lib/jenkins/bin/kubectl'
+  }
+
+  stages {
+    stage('Clean workspace') {
+      steps {
+        deleteDir()
+      }
+    }
+
+    stage('Checkout') {
+      steps {
+        git branch: 'main', url: 'https://github.com/spring-projects/spring-petclinic.git'
+      }
+    }
+
+    stage('Install kubectl') {
+      steps {
+        sh '''
+          set -eux
+          mkdir -p /var/lib/jenkins/bin
+          curl -fsSL -o /var/lib/jenkins/bin/kubectl \
+            "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x /var/lib/jenkins/bin/kubectl
+          /var/lib/jenkins/bin/kubectl version --client
+        '''
+      }
+    }
+
+    stage('Verify Java 21 JDK and Maven Wrapper') {
+      steps {
+        sh '''
+          set -eux
+          echo "JAVA_HOME=$JAVA_HOME"
+
+          test -x "$JAVA_HOME/bin/java"
+          "$JAVA_HOME/bin/java" -version
+
+          if [ ! -x "$JAVA_HOME/bin/javac" ]; then
+            echo "ERROR: javac not found in $JAVA_HOME/bin"
+            exit 1
+          fi
+
+          "$JAVA_HOME/bin/javac" -version
+
+          chmod +x mvnw
+          ./mvnw -version
+        '''
+      }
+    }
+
+    stage('Verify Docker CLI') {
+      steps {
+        sh '''
+          set -eux
+          command -v docker >/dev/null 2>&1
+          docker version
+        '''
+      }
+    }
+
+    stage('Build with Maven Wrapper') {
+      steps {
+        sh '''
+          set -eux
+          chmod +x mvnw
+          ./mvnw -B clean package -DskipTests
+        '''
+      }
+    }
+
+    stage('Create Dockerfile') {
+      steps {
+        sh '''
+          set -eux
+          cat > Dockerfile <<'EOF'
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY target/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+EOF
+          cat Dockerfile
+        '''
+      }
+    }
+
+    stage('Build Container Image') {
+      steps {
+        sh '''
+          set -eux
+          docker build -t "$IMAGE_FULL" .
+        '''
+      }
+    }
+
+    stage('Push Container Image') {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: 'docker-registry-creds',
+          usernameVariable: 'DOCKER_USERNAME',
+          passwordVariable: 'DOCKER_PASSWORD'
+        )]) {
+          sh '''
+            set -eux
+            echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin "$REGISTRY"
+            docker push "$IMAGE_FULL"
+            docker logout "$REGISTRY"
+          '''
+        }
+      }
+    }
+
+    stage('Render Kubernetes Manifest') {
+      steps {
+        sh '''
+          set -eux
+          mkdir -p k8s
+          test -f "$MANIFEST_TEMPLATE"
+
+          sed \
+            -e "s|__IMAGE__|${IMAGE_FULL}|g" \
+            -e "s|__NAMESPACE__|${NAMESPACE}|g" \
+            "$MANIFEST_TEMPLATE" > "$RENDERED_FILE"
+
+          cat "$RENDERED_FILE"
+        '''
+      }
+    }
+
+    stage('Deploy to Kubernetes') {
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig-vagrant', variable: 'KUBECONFIG')]) {
+          sh '''#!/bin/bash
+set -euxo pipefail
+
+"$KUBECTL" get deploy,rs,pods,svc -n "$NAMESPACE" -o wide || true
+
+"$KUBECTL" delete deployment petclinic -n "$NAMESPACE" --ignore-not-found=true || true
+"$KUBECTL" delete pod -l app=petclinic -n "$NAMESPACE" --ignore-not-found=true --force --grace-period=0 || true
+
+sleep 10
+
+"$KUBECTL" apply -f "$RENDERED_FILE"
+
+if ! "$KUBECTL" rollout status deployment/petclinic -n "$NAMESPACE" --timeout=420s; then
+  echo "Rollout failed. Diagnostics:"
+  "$KUBECTL" get deploy,rs,pods,svc -n "$NAMESPACE" -o wide || true
+  "$KUBECTL" describe deployment petclinic -n "$NAMESPACE" || true
+  "$KUBECTL" describe rs -l app=petclinic -n "$NAMESPACE" || true
+  "$KUBECTL" describe pods -l app=petclinic -n "$NAMESPACE" || true
+  "$KUBECTL" logs -l app=petclinic -n "$NAMESPACE" --tail=200 || true
+  "$KUBECTL" get events -n "$NAMESPACE" --sort-by=.metadata.creationTimestamp | tail -50 || true
+  exit 1
+fi
+
+LB_IP=""
+for i in {1..60}; do
+  LB_IP=$("$KUBECTL" get svc petclinic -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+  if [ -n "$LB_IP" ]; then
+    break
+  fi
+  echo "Waiting for MetalLB external IP..."
+  sleep 5
+done
+
+"$KUBECTL" get deploy,rs,pods,svc -n "$NAMESPACE" -o wide
+
+if [ -z "$LB_IP" ]; then
+  echo "LoadBalancer IP was not assigned."
+  "$KUBECTL" get pods -n metallb-system -o wide || true
+  "$KUBECTL" get ipaddresspools,l2advertisements -n metallb-system || true
+  exit 1
+fi
+
+echo "Petclinic LoadBalancer IP: $LB_IP"
+echo "Open: http://$LB_IP"
+'''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'k8s/*.yaml', allowEmptyArchive: true
+      deleteDir()
+    }
+  }
+}
