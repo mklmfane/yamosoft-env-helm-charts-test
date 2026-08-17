@@ -1,3 +1,11 @@
+require "yaml"
+
+vagrant_root = File.dirname(File.expand_path(__FILE__))
+settings = YAML.load_file "#{vagrant_root}/settings.yaml"
+
+# Read the PAT from the local operating-system environment.
+github_pat = ENV.fetch("GITHUB_PAT", "")
+
 ---
 # cluster_name is used to group the nodes in a folder within VirtualBox:
 cluster_name: Kubernetes Cluster
@@ -18,6 +26,11 @@ network:
   jenkins_port: 8080
   jenkins_ssh_port: 2222
 
+  github_actions_ip: "192.168.56.30"
+  github_actions_port: 8081
+  github_actions_ssh_port: 2223
+
+
   dns_servers:
     - 8.8.8.8
     - 1.1.1.1
@@ -34,6 +47,10 @@ nodes:
   jenkins:
     cpu: 2
     memory: 2048
+
+  github_actions:
+    cpu: 2
+    memory: 4096
 
 # Mount additional shared folders from the host into each virtual machine.
 # Note that the project directory is automatically mounted at /vagrant.
