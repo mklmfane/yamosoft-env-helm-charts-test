@@ -7,13 +7,16 @@ export DEBIAN_FRONTEND=noninteractive
 
 echo "=== [1/7] Updating base system ==="
 apt-get update -y
-apt-get -o Dpkg::Options::="--force-confold" upgrade -y
+#apt-get -o Dpkg::Options::="--force-confold" upgrade -y
 
 # Install base tools
-apt-get install -y qemu-guest-agent software-properties-common curl \
+#apt-get install -y qemu-guest-agent software-properties-common curl \
+#                   apt-transport-https ca-certificates jq ipvsadm gnupg
+apt-get install -y software-properties-common curl \
                    apt-transport-https ca-certificates jq ipvsadm gnupg
 
-systemctl restart qemu-guest-agent || true
+
+#systemctl restart qemu-guest-agent || true
 
 echo "=== [2/7] Configuring DNS ==="
 mkdir -p /etc/systemd/resolved.conf.d/
@@ -84,8 +87,12 @@ apt-mark hold kubelet kubeadm kubectl cri-o
 sudo apt-get install curl gpg apt-transport-https --yes
 curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
 echo "deb [signed-by=/usr/share/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
-sudo apt-get update
-sudo apt-get install helm
+sudo apt-get update -y
+sudo apt-get install -y helm
+
+
+apt-get install -y curl gpg apt-transport-https
+
 
 echo "=== [7/7] Configure kubelet node IP ==="
 local_ip="$(ip --json a s | jq -r '.[] | select(.ifname=="eth1") | .addr_info[] | select(.family=="inet") | .local')"
@@ -98,6 +105,5 @@ echo "=== ✅ Common setup complete! ==="
 
 # Reboot if required
 if [ -f /var/run/reboot-required ]; then
-  echo "🔄 Reboot required, rebooting..."
-  reboot
+  echo "WARNING: A reboot is recommended, but provisioning will continue."
 fi
