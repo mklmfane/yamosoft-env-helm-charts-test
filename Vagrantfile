@@ -1,39 +1,57 @@
 require "yaml"
 
 vagrant_root = File.dirname(File.expand_path(__FILE__))
-settings = YAML.load_file "#{vagrant_root}/settings.yaml"
+settings = YAML.load_file(File.join(vagrant_root, "settings.yaml"))
 
-IP_SECTIONS = settings["network"]["control_ip"].match(/^([0-9.]+\.)([^.]+)$/)
-IP_NW = IP_SECTIONS.captures[0]
-IP_START = Integer(IP_SECTIONS.captures[1])
-NUM_WORKER_NODES = settings["nodes"]["workers"]["count"]
-CLUSTER_NAME = settings["cluster_name"].gsub(" ", "_")
+# Read the PAT only from the local host operating-system environment.
+# Never store this secret in settings.yaml or commit it to source control.
+github_pat = ENV.fetch("GITHUB_PAT", "").strip
+
+ip_sections = settings["network"]["control_ip"].match(/^([0-9.]+\.)([^.]+)$/)
+raise "Invalid network.control_ip in settings.yaml" unless ip_sections
+
+ip_network = ip_sections.captures[0]
+ip_start = Integer(ip_sections.captures[1])
+num_worker_nodes = Integer(settings["nodes"]["workers"]["count"])
+cluster_name = settings["cluster_name"].gsub(" ", "_")
+runner_settings = settings.fetch("software").fetch("github_actions")
 
 Vagrant.configure("2") do |config|
-  # Pick box based on arch
-  config.vm.box = `uname -m`.strip == "aarch64" ? "#{settings["software"]["box"]}-arm64" : settings["software"]["box"]
+  # Pick the box that matches the host architecture.
+  config.vm.box = if `uname -m`.strip == "aarch64"
+                    "#{settings["software"]["box"]}-arm64"
+                  else
+                    settings["software"]["box"]
+                  end
   config.vm.box_check_update = true
-  config.vm.boot_timeout = 300  # Increase SSH wait timeout
+  config.vm.boot_timeout = 300
 
-
-  # Common provisioning
+  # Common host entries for every VM. Do not run a full OS upgrade here;
+  # package upgrades can restart services and kernels during provisioning.
   config.vm.provision "shell",
-    env: { "IP_NW" => IP_NW, 
-           "IP_START" => IP_START, "NUM_WORKER_NODES" => NUM_WORKER_NODES, 
-           "DNS_SERVERS" => settings["network"]["dns_servers"].join(" "),
-           "GITHUB_PAT" => github_pat,
-           "RUNNER_VERSION" => settings["software"]["github_actions"]["version"].to_s,
-           "RUNNER_SHA256" => settings["software"]["github_actions"]["sha256"].to_s,
-           "RUNNER_REPOSITORY_URL" => settings["software"]["github_actions"]["repository_url"].to_s,
-           "RUNNER_NAME" => settings["software"]["github_actions"]["runner_name"].to_s,
-           "RUNNER_LABELS" => settings["software"]["github_actions"]["labels"].to_s,
-           "RUNNER_WORK_FOLDER" => settings["software"]["github_actions"]["work_folder"].to_s
+    env: {
+      "IP_NW" => ip_network,
+      "IP_START" => ip_start.to_s,
+      "NUM_WORKER_NODES" => num_worker_nodes.to_s
     },
     inline: <<-SHELL
-      apt-get update && apt-get upgrade -y
-      echo "$IP_NW$((IP_START)) controlplane" >> /etc/hosts
-      for i in $(seq 1 ${NUM_WORKER_NODES}); do
-        echo "$IP_NW$((IP_START+i)) node0${i}" >> /etc/hosts
+      set -eu
+
+      apt-get update -y
+
+      add_host_entry() {
+        entry_ip="$1"
+        entry_name="$2"
+
+        if ! grep -qE "(^|[[:space:]])${entry_name}([[:space:]]|$)" /etc/hosts; then
+          echo "${entry_ip} ${entry_name}" >> /etc/hosts
+        fi
+      }
+
+      add_host_entry "${IP_NW}${IP_START}" "controlplane"
+
+      for i in $(seq 1 "${NUM_WORKER_NODES}"); do
+        add_host_entry "${IP_NW}$((IP_START + i))" "node0${i}"
       done
     SHELL
 
@@ -48,13 +66,13 @@ Vagrant.configure("2") do |config|
       vb.cpus = settings["nodes"]["control"]["cpu"]
       vb.memory = settings["nodes"]["control"]["memory"]
       vb.gui = false
-      vb.name = "#{CLUSTER_NAME}_controlplane"
+      vb.name = "#{cluster_name}_controlplane"
     end
 
     controlplane.vm.provision "shell",
       env: {
         "DNS_SERVERS" => settings["network"]["dns_servers"].join(" "),
-        "ENVIRONMENT" => settings["environment"],
+        "ENVIRONMENT" => settings.fetch("environment", "").to_s,
         "KUBERNETES_VERSION" => settings["software"]["kubernetes"],
         "KUBERNETES_VERSION_SHORT" => settings["software"]["kubernetes"][0..3],
         "OS" => settings["software"]["os"]
@@ -72,24 +90,24 @@ Vagrant.configure("2") do |config|
   end
 
   # ===================
-  # Kuberntes WORKERS
+  # KUBERNETES WORKERS
   # ===================
-  (1..NUM_WORKER_NODES).each do |i|
+  (1..num_worker_nodes).each do |i|
     config.vm.define "node0#{i}" do |node|
       node.vm.hostname = "node0#{i}"
-      node.vm.network "private_network", ip: IP_NW + "#{IP_START + i}"
+      node.vm.network "private_network", ip: "#{ip_network}#{ip_start + i}"
 
       node.vm.provider "virtualbox" do |vb|
         vb.cpus = settings["nodes"]["workers"]["cpu"]
         vb.memory = settings["nodes"]["workers"]["memory"]
         vb.gui = false
-        vb.name = "#{CLUSTER_NAME}_node0#{i}"
+        vb.name = "#{cluster_name}_node0#{i}"
       end
 
       node.vm.provision "shell",
         env: {
           "DNS_SERVERS" => settings["network"]["dns_servers"].join(" "),
-          "ENVIRONMENT" => settings["environment"],
+          "ENVIRONMENT" => settings.fetch("environment", "").to_s,
           "KUBERNETES_VERSION" => settings["software"]["kubernetes"],
           "KUBERNETES_VERSION_SHORT" => settings["software"]["kubernetes"][0..3],
           "OS" => settings["software"]["os"]
@@ -97,7 +115,6 @@ Vagrant.configure("2") do |config|
         path: "scripts/common.sh"
 
       node.vm.provision "shell", path: "scripts/node.sh"
-
     end
   end
 
@@ -108,15 +125,24 @@ Vagrant.configure("2") do |config|
     jenkins.vm.hostname = "jenkins"
     jenkins.vm.network "private_network", ip: settings["network"]["jenkins_ip"]
 
-    # Optional port forwarding to host
-    jenkins.vm.network "forwarded_port", guest: 8080, host: settings["network"]["jenkins_port"], auto_correct: true
-    jenkins.vm.network "forwarded_port", guest: 22, host: settings["network"]["jenkins_ssh_port"], auto_correct: true
+    jenkins.vm.network "forwarded_port",
+      guest: 8080,
+      host: settings["network"]["jenkins_port"],
+      id: "jenkins-http",
+      auto_correct: true
+
+    jenkins.vm.network "forwarded_port",
+      guest: 22,
+      host: settings["network"]["jenkins_ssh_port"],
+      host_ip: "127.0.0.1",
+      id: "ssh",
+      auto_correct: true
 
     jenkins.vm.provider "virtualbox" do |vb|
       vb.cpus = settings["nodes"]["jenkins"]["cpu"]
       vb.memory = settings["nodes"]["jenkins"]["memory"]
       vb.gui = false
-      vb.name = "#{CLUSTER_NAME}_jenkins"
+      vb.name = "#{cluster_name}_jenkins"
     end
 
     jenkins.vm.provision "shell",
@@ -124,23 +150,37 @@ Vagrant.configure("2") do |config|
         "DNS_SERVERS" => settings["network"]["dns_servers"].join(" ")
       },
       inline: <<-SHELL
-        set -eux
+        set -eu
+
+        export DEBIAN_FRONTEND=noninteractive
         apt-get update -y
         apt-get install -y qemu-guest-agent ca-certificates curl gnupg lsb-release apt-transport-https
         systemctl restart qemu-guest-agent || true
 
-        mkdir -p /etc/systemd/resolved.conf.d/
-        cat <<EOF >/etc/systemd/resolved.conf.d/dns_servers.conf
-[Resolve]
-DNS=${DNS_SERVERS}
-EOF
+        mkdir -p /etc/systemd/resolved.conf.d
+        {
+          echo "[Resolve]"
+          echo "DNS=${DNS_SERVERS}"
+          echo "FallbackDNS=${DNS_SERVERS}"
+        } > /etc/systemd/resolved.conf.d/dns_servers.conf
         systemctl restart systemd-resolved || true
 
-        echo "#{settings["network"]["control_ip"]} controlplane" >> /etc/hosts
-        for i in $(seq 1 #{NUM_WORKER_NODES}); do
-          echo "#{IP_NW}$((#{IP_START}+i)) node0${i}" >> /etc/hosts
+        add_host_entry() {
+          entry_ip="$1"
+          entry_name="$2"
+
+          if ! grep -qE "(^|[[:space:]])${entry_name}([[:space:]]|$)" /etc/hosts; then
+            echo "${entry_ip} ${entry_name}" >> /etc/hosts
+          fi
+        }
+
+        add_host_entry "#{settings["network"]["control_ip"]}" "controlplane"
+
+        for i in $(seq 1 #{num_worker_nodes}); do
+          add_host_entry "#{ip_network}$((#{ip_start} + i))" "node0${i}"
         done
-        echo "#{settings["network"]["jenkins_ip"]} jenkins" >> /etc/hosts
+
+        add_host_entry "#{settings["network"]["jenkins_ip"]}" "jenkins"
       SHELL
 
     jenkins.vm.provision "shell",
@@ -156,7 +196,8 @@ EOF
   config.vm.define "ghaction" do |ghaction|
     ghaction.vm.hostname = "gha-runner"
 
-    # Private network access to the Kubernetes lab.
+    # NAT remains enabled for outbound access to GitHub. This private adapter
+    # gives workflow jobs access to the Kubernetes lab.
     ghaction.vm.network "private_network",
       ip: settings["network"]["github_actions_ip"]
 
@@ -165,17 +206,19 @@ EOF
       guest: 8080,
       host: settings["network"]["github_actions_port"],
       host_ip: "127.0.0.1",
+      id: "ghaction-http",
       auto_correct: true
 
-    # Optional SSH forwarding.
+    # Use Vagrant's SSH forwarding rule rather than declaring a second rule.
     ghaction.vm.network "forwarded_port",
       guest: 22,
       host: settings["network"]["github_actions_ssh_port"],
       host_ip: "127.0.0.1",
+      id: "ssh",
       auto_correct: true
 
     ghaction.vm.provider "virtualbox" do |vb|
-      vb.name = "#{CLUSTER_NAME}_github_actions"
+      vb.name = "#{cluster_name}_github_actions"
       vb.gui = false
       vb.cpus = settings["nodes"]["github_actions"]["cpu"]
       vb.memory = settings["nodes"]["github_actions"]["memory"]
@@ -186,138 +229,159 @@ EOF
 
     ghaction.vm.provision "shell",
       env: {
-        "DNS_SERVERS" => settings["network"]["dns_servers"].join(" ")
+        "DNS_SERVERS" => settings["network"]["dns_servers"].join(" "),
+        "GITHUB_PAT" => github_pat,
+        "RUNNER_VERSION" => runner_settings.fetch("version").to_s,
+        "RUNNER_SHA256" => runner_settings.fetch("sha256").to_s,
+        "RUNNER_REPOSITORY_URL" => runner_settings.fetch("repository_url").to_s,
+        "RUNNER_NAME" => runner_settings.fetch("runner_name").to_s,
+        "RUNNER_LABELS" => runner_settings.fetch("labels").to_s,
+        "RUNNER_WORK_FOLDER" => runner_settings.fetch("work_folder").to_s
       },
       inline: <<-SHELL
         set -eu
 
         export DEBIAN_FRONTEND=noninteractive
+        RUNNER_DIR="/home/vagrant/actions-runner"
 
-        apt-get update -y
-
-        apt-get install -y \
-          ca-certificates \
-          curl \
-          git \
-          jq \
-          tar \
-          unzip
-
-        # Configure DNS.
-        mkdir -p /etc/systemd/resolved.conf.d
-
-        cat > /etc/systemd/resolved.conf.d/dns_servers.conf <<EOF
-[Resolve]
-DNS=${DNS_SERVERS}
-EOF
-
-        systemctl restart systemd-resolved
-        resolvectl flush-caches
-
-        # Add an entry only when the hostname is not already present.
-        add_host_entry() {
-          host_ip="$1"
-          host_name="$2"
-
-          if ! grep -qE "(^|[[:space:]])${host_name}([[:space:]]|$)" /etc/hosts; then
-            echo "${host_ip} ${host_name}" >> /etc/hosts
-          fi
-        }
-
-        # Control plane.
-        add_host_entry \
-          "#{settings["network"]["control_ip"]}" \
-          "controlplane"
-
-        # Kubernetes workers.
-        for i in $(seq 1 #{NUM_WORKER_NODES}); do
-          worker_ip="#{IP_NW}$((#{IP_START} + i))"
-          worker_name="node0${i}"
-          add_host_entry "${worker_ip}" "${worker_name}"
-        done
-
-        # Jenkins.
-        add_host_entry \
-          "#{settings["network"]["jenkins_ip"]}" \
-          "jenkins"
-
-        # GitHub Actions runner.
-        add_host_entry \
-          "#{settings["network"]["github_actions_ip"]}" \
-          "gha-runner"
-
-        # Create the runner installation directory.
-        install -d \
-          -m 0755 \
-          -o vagrant \
-          -g vagrant \
-          /home/vagrant/actions-runner
-
-
-        # Register only when the runner is not already configured.
-        if [ ! -f "${RUNNER_DIR}/.runner" ]; then
-          if [ -z "${GITHUB_PAT:-}" ]; then
-            echo "ERROR: No GitHub PAT was supplied." >&2
-            echo "Expected PAT file or GITHUB_PAT environment variable." >&2
-            exit 1
-          fi
-
-        # Convert the repository URL into owner/repository.
-        REPOSITORY_PATH="${RUNNER_REPOSITORY_URL#https://github.com/}"
-        REPOSITORY_PATH="${REPOSITORY_PATH%.git}"
-
-        echo "Generating a short-lived registration token..."
-
-        RUNNER_TOKEN="$(
-          curl \
-            --silent \
-            --show-error \
-            --fail-with-body \
-            --request POST \
-            --header "Accept: application/vnd.github+json" \
-            --header "Authorization: Bearer ${GITHUB_PAT}" \
-            --header "X-GitHub-Api-Version: 2026-03-10" \
-            "https://api.github.com/repos/${REPOSITORY_PATH}/actions/runners/registration-token" |
-          jq -er '.token'
-        )"
-
-        # The long-lived PAT is no longer required.
-        unset GITHUB_PAT
-
-        if [ -z "${RUNNER_TOKEN}" ]; then
-          echo "ERROR: GitHub returned an empty registration token." >&2
+        if [ "$(uname -m)" != "x86_64" ]; then
+          echo "ERROR: This configuration installs the x64 GitHub Actions runner." >&2
           exit 1
         fi
 
-        echo "Registering ${RUNNER_NAME} with ${RUNNER_REPOSITORY_URL}..."
+        apt-get update -y
+        apt-get install -y ca-certificates curl git jq tar unzip
 
-        (
-          cd "${RUNNER_DIR}"
+        # Configure DNS through systemd-resolved.
+        mkdir -p /etc/systemd/resolved.conf.d
+        {
+          echo "[Resolve]"
+          echo "DNS=${DNS_SERVERS}"
+          echo "FallbackDNS=${DNS_SERVERS}"
+        } > /etc/systemd/resolved.conf.d/dns_servers.conf
+        systemctl restart systemd-resolved
+        resolvectl flush-caches || true
 
-          runuser -u vagrant -- ./config.sh \
-            --url "${RUNNER_REPOSITORY_URL}" \
-            --token "${RUNNER_TOKEN}" \
-            --name "${RUNNER_NAME}" \
-            --labels "${RUNNER_LABELS}" \
-            --work "${RUNNER_WORK_FOLDER}" \
-            --unattended
-          )
+        add_host_entry() {
+          entry_ip="$1"
+          entry_name="$2"
 
-        unset RUNNER_TOKEN
-        else
-          REGISTERED_URL="$(
-            jq -r '.gitHubUrl // empty' "${RUNNER_DIR}/.runner"
-          )"
+          if ! grep -qE "(^|[[:space:]])${entry_name}([[:space:]]|$)" /etc/hosts; then
+            echo "${entry_ip} ${entry_name}" >> /etc/hosts
+          fi
+        }
 
-          if [ -n "${REGISTERED_URL}" ] &&
-          [ "${REGISTERED_URL}" != "${RUNNER_REPOSITORY_URL}" ]; then
-            echo "ERROR: Runner is registered to ${REGISTERED_URL}" >&2
-            echo "Expected: ${RUNNER_REPOSITORY_URL}" >&2
+        add_host_entry "#{settings["network"]["control_ip"]}" "controlplane"
+
+        for i in $(seq 1 #{num_worker_nodes}); do
+          add_host_entry "#{ip_network}$((#{ip_start} + i))" "node0${i}"
+        done
+
+        add_host_entry "#{settings["network"]["jenkins_ip"]}" "jenkins"
+        add_host_entry "#{settings["network"]["github_actions_ip"]}" "githubaction"
+
+        install -d -m 0755 -o vagrant -g vagrant "${RUNNER_DIR}"
+
+        # Download and verify the pinned runner release once.
+        if [ ! -x "${RUNNER_DIR}/config.sh" ]; then
+          runner_archive="actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+          runner_archive_path="/tmp/${runner_archive}"
+          runner_download_url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${runner_archive}"
+
+          curl --fail --location --retry 5 --retry-delay 2 \
+            --output "${runner_archive_path}" \
+            "${runner_download_url}"
+
+          echo "${RUNNER_SHA256}  ${runner_archive_path}" | sha256sum --check -
+          tar --extract --gzip --file "${runner_archive_path}" --directory "${RUNNER_DIR}"
+          rm -f "${runner_archive_path}"
+          chown -R vagrant:vagrant "${RUNNER_DIR}"
+
+          "${RUNNER_DIR}/bin/installdependencies.sh"
+        fi
+
+        # Register only when this VM has not already been configured.
+        if [ ! -f "${RUNNER_DIR}/.runner" ]; then
+          if [ -z "${GITHUB_PAT:-}" ]; then
+            echo "ERROR: No GitHub PAT was supplied." >&2
+            echo "Export GITHUB_PAT in the host shell before running Vagrant." >&2
             exit 1
           fi
 
-          echo "Runner is already registered with ${REGISTERED_URL}."
+          repository_path="${RUNNER_REPOSITORY_URL#https://github.com/}"
+          repository_path="${repository_path%/}"
+          repository_path="${repository_path%.git}"
+
+          case "${repository_path}" in
+            */*) ;;
+            *)
+              echo "ERROR: Invalid GitHub repository URL: ${RUNNER_REPOSITORY_URL}" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "Generating a short-lived GitHub runner registration token..."
+          runner_token="$(
+            curl --silent --show-error --fail-with-body \
+              --request POST \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GITHUB_PAT}" \
+              --header "X-GitHub-Api-Version: 2026-03-10" \
+              "https://api.github.com/repos/${repository_path}/actions/runners/registration-token" |
+              jq -er '.token'
+          )"
+
+          # The long-lived PAT is not needed after the short-lived token exists.
+          unset GITHUB_PAT
+
+          if [ -z "${runner_token}" ]; then
+            echo "ERROR: GitHub returned an empty runner registration token." >&2
+            exit 1
+          fi
+
+          (
+            cd "${RUNNER_DIR}"
+            runuser -u vagrant -- ./config.sh \
+              --url "${RUNNER_REPOSITORY_URL}" \
+              --token "${runner_token}" \
+              --name "${RUNNER_NAME}" \
+              --labels "${RUNNER_LABELS}" \
+              --work "${RUNNER_WORK_FOLDER}" \
+              --unattended \
+              --replace
+          )
+
+          unset runner_token
+        else
+          registered_url="$(jq -r '.gitHubUrl // empty' "${RUNNER_DIR}/.runner")"
+
+          if [ "${registered_url%/}" != "${RUNNER_REPOSITORY_URL%/}" ]; then
+            echo "ERROR: Runner is registered to ${registered_url}." >&2
+            echo "Expected ${RUNNER_REPOSITORY_URL}." >&2
+            exit 1
+          fi
+
+          echo "Runner is already registered with ${registered_url}."
         fi
+
+        # Keep needrestart from interrupting the runner service during jobs.
+        mkdir -p /etc/needrestart/conf.d
+        echo '$nrconf{override_rc}{qr(^actions\\.runner\\..+\\.service$)} = 0;' \
+          > /etc/needrestart/conf.d/actions_runner_services.conf
+
+        # Install and start the runner as a systemd service.
+        if [ ! -f "${RUNNER_DIR}/.service" ]; then
+          (
+            cd "${RUNNER_DIR}"
+            ./svc.sh install vagrant
+          )
+        fi
+
+        (
+          cd "${RUNNER_DIR}"
+          ./svc.sh start
+          ./svc.sh status
+        )
       SHELL
   end
 end
