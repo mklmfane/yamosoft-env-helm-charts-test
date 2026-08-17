@@ -278,7 +278,6 @@ Vagrant.configure("2") do |config|
         done
 
         add_host_entry "#{settings["network"]["jenkins_ip"]}" "jenkins"
-        add_host_entry "#{settings["network"]["github_actions_ip"]}" "githubaction"
 
         install -d -m 0755 -o vagrant -g vagrant "${RUNNER_DIR}"
 
