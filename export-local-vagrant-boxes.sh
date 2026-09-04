@@ -3,13 +3,14 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./export-local-vagrant-boxes.sh [--force] [--destination DIR]
+Usage: ./export-local-vagrant-boxes.sh [--force] [--exclude NAME] [--destination DIR]
 
 Exports every box reported by `vagrant box list` into a local box repository,
 writes SHA-256 files, and creates versioned catalogs.
 
 Options:
   --destination DIR  Destination. Default: /srv/vagrant-boxes
+  --exclude NAME     Skip an exact box name. May be specified more than once.
   --force            Repackage and replace existing archives.
   -h, --help         Show this help.
 EOF
@@ -30,12 +31,18 @@ slugify() {
 
 destination_dir="/srv/vagrant-boxes"
 force=0
+excluded_boxes=()
 
 while (($#)); do
   case "$1" in
     --destination)
       (($# >= 2)) || die "--destination requires a directory"
       destination_dir="$2"
+      shift 2
+      ;;
+    --exclude)
+      (($# >= 2)) || die "--exclude requires an exact Vagrant box name"
+      excluded_boxes+=("$2")
       shift 2
       ;;
     --force)
@@ -95,9 +102,10 @@ if [[ "$cache_kib" =~ ^[0-9]+$ && "$available_kib" =~ ^[0-9]+$ ]]; then
 fi
 
 manifest="$(mktemp)"
+failure_manifest="$(mktemp)"
 work_dir="$(mktemp -d)"
 cleanup() {
-  rm -f -- "$manifest"
+  rm -f -- "$manifest" "$failure_manifest"
   rm -rf -- "$work_dir"
 }
 trap cleanup EXIT
@@ -110,6 +118,17 @@ for line in "${box_lines[@]}"; do
 
   box_name="${BASH_REMATCH[1]}"
   box_name="$(printf '%s' "$box_name" | sed -E 's/[[:space:]]+$//')"
+
+  skip_box=0
+  for excluded_box in "${excluded_boxes[@]}"; do
+    if [[ "$box_name" == "$excluded_box" ]]; then
+      info "Skipping excluded box ${box_name}"
+      skip_box=1
+      break
+    fi
+  done
+  ((skip_box == 1)) && continue
+
   provider="${BASH_REMATCH[2]}"
   version="${BASH_REMATCH[3]}"
   architecture="${BASH_REMATCH[5]:-amd64}"
@@ -138,6 +157,16 @@ for line in "${box_lines[@]}"; do
     fi
   fi
 
+  # A previous interrupted run may have left a non-empty but truncated file
+  # at the canonical path. Quarantine it before deciding whether to rebuild.
+  if [[ -s "$archive" ]] && ! tar -tf "$archive" >/dev/null 2>&1; then
+    invalid_archive="${archive}.invalid"
+    [[ -e "$invalid_archive" ]] && invalid_archive="${archive}.invalid.$(date +%s)"
+    printf 'WARNING: quarantining invalid canonical archive as %s\n' "$invalid_archive" >&2
+    mv -- "$archive" "$invalid_archive"
+    [[ -f "${archive}.sha256" ]] && mv -- "${archive}.sha256" "${invalid_archive}.sha256"
+  fi
+
   if [[ -s "$archive" && $force -eq 0 ]]; then
     info "Keeping existing ${filename}"
   else
@@ -151,7 +180,15 @@ for line in "${box_lines[@]}"; do
     mv -- "$work_dir/package.box" "$archive"
   fi
 
-  tar -tf "$archive" >/dev/null || die "invalid box archive: ${archive}"
+  if ! tar -tf "$archive" >/dev/null 2>&1; then
+    invalid_archive="${archive}.invalid"
+    [[ -e "$invalid_archive" ]] && invalid_archive="${archive}.invalid.$(date +%s)"
+    printf 'WARNING: generated archive is invalid; preserving it as %s\n' "$invalid_archive" >&2
+    mv -- "$archive" "$invalid_archive"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$box_name" "$provider" "$version" "$architecture" "$invalid_archive" >> "$failure_manifest"
+    continue
+  fi
   checksum="$(sha256sum "$archive" | awk '{print $1}')"
   printf '%s  %s\n' "$checksum" "$filename" > "${archive}.sha256"
   relative_archive="${name_slug}/${filename}"
@@ -226,3 +263,12 @@ info "Export completed"
 find "$destination_dir" -maxdepth 3 -type f \
   \( -name '*.box' -o -name '*.box.sha256' -o -name '*.json' \) \
   -printf '%p\t%k KB\n' | sort
+
+if [[ -s "$failure_manifest" ]]; then
+  printf '\nWARNING: these installed boxes could not be exported:\n' >&2
+  while IFS=$'\t' read -r failed_name failed_provider failed_version failed_arch failed_file; do
+    printf '  - %s (%s, %s, %s): %s\n' \
+      "$failed_name" "$failed_provider" "$failed_version" "$failed_arch" "$failed_file" >&2
+  done < "$failure_manifest"
+  exit 2
+fi
