@@ -111,6 +111,24 @@ for line in "${box_lines[@]}"; do
   filename="${name_slug}-${version}-${provider}-${architecture}.box"
   archive="${archive_dir}/${filename}"
 
+  # Recover archives created by the earlier flat-layout version of this
+  # script. Valid files are moved into the per-box directory. Truncated files
+  # are retained with an .invalid suffix so they cannot be mistaken for boxes.
+  flat_archive="${destination_dir}/${filename}"
+  if [[ -s "$flat_archive" && ! -e "$archive" ]]; then
+    if tar -tf "$flat_archive" >/dev/null 2>&1; then
+      info "Adopting valid flat-layout archive ${filename}"
+      mv -- "$flat_archive" "$archive"
+      [[ -f "${flat_archive}.sha256" ]] && rm -f -- "${flat_archive}.sha256"
+    else
+      invalid_archive="${flat_archive}.invalid"
+      [[ -e "$invalid_archive" ]] && invalid_archive="${flat_archive}.invalid.$(date +%s)"
+      printf 'WARNING: quarantining truncated archive as %s\n' "$invalid_archive" >&2
+      mv -- "$flat_archive" "$invalid_archive"
+      [[ -f "${flat_archive}.sha256" ]] && mv -- "${flat_archive}.sha256" "${invalid_archive}.sha256"
+    fi
+  fi
+
   if [[ -s "$archive" && $force -eq 0 ]]; then
     info "Keeping existing ${filename}"
   else
