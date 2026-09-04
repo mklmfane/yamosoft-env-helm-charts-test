@@ -1,0 +1,3 @@
+# Multi-gigabyte local artifacts. Catalogs and checksum files remain trackable.
+*.box
+
