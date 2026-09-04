@@ -16,14 +16,48 @@ num_worker_nodes = Integer(settings["nodes"]["workers"]["count"])
 cluster_name = settings["cluster_name"].gsub(" ", "_")
 runner_settings = settings.fetch("software").fetch("github_actions")
 
+# Use the locally hosted VirtualBox box instead of HCP Vagrant Registry.
+local_box_name = "yamosoft/ubuntu-24.04-local"
+local_box_path = "/srv/vagrant-boxes/bento-ubuntu-24.04/bento-ubuntu-24.04-202510.26.0-virtualbox-amd64.box"
+local_box_checksum_path = "#{local_box_path}.sha256"
+
+unless File.file?(local_box_path)
+  raise <<~ERROR
+    Local VirtualBox box not found:
+      #{local_box_path}
+
+    Run the local box export script before running `vagrant up`.
+  ERROR
+end
+
+unless File.file?(local_box_checksum_path)
+  raise <<~ERROR
+    SHA-256 file not found:
+      #{local_box_checksum_path}
+
+    Generate it with:
+      cd #{File.dirname(local_box_path)}
+      sha256sum #{File.basename(local_box_path)} > #{File.basename(local_box_checksum_path)}
+  ERROR
+end
+
+local_box_checksum = File.read(local_box_checksum_path).split.first
+unless local_box_checksum&.match?(/\A[0-9a-fA-F]{64}\z/)
+  raise "Invalid SHA-256 value in #{local_box_checksum_path}"
+end
+
 Vagrant.configure("2") do |config|
-  # Pick the box that matches the host architecture.
-  config.vm.box = if `uname -m`.strip == "aarch64"
-                    "#{settings["software"]["box"]}-arm64"
-                  else
-                    settings["software"]["box"]
-                  end
-  config.vm.box_check_update = true
+  # This archive is an amd64 VirtualBox box stored on the local Ubuntu host.
+  host_architecture = `uname -m`.strip
+  unless ["x86_64", "amd64"].include?(host_architecture)
+    raise "Local box requires amd64/x86_64; detected #{host_architecture}"
+  end
+
+  config.vm.box = local_box_name
+  config.vm.box_url = "file://#{local_box_path}"
+  config.vm.box_download_checksum_type = "sha256"
+  config.vm.box_download_checksum = local_box_checksum
+  config.vm.box_check_update = false
   config.vm.boot_timeout = 300
 
   # Common host entries for every VM. Do not run a full OS upgrade here;
