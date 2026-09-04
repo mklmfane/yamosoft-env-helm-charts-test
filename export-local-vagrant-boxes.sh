@@ -71,6 +71,16 @@ destination_dir="$(cd -- "$destination_dir" && pwd -P)"
 info "Repository root: ${repo_root}"
 info "Box destination: ${destination_dir}"
 
+# Adopt the libvirt archive created by the documented manual procedure. A
+# generic package.box has no identity, so only this known path can be mapped
+# safely without rebuilding it.
+legacy_libvirt="${source_dir}/jtarpley-ubuntu2404/package.box"
+legacy_libvirt_target="${destination_dir}/jtarpley-ubuntu2404-base-2025.11.12-libvirt-amd64.box"
+if [[ -s "$legacy_libvirt" && ( ! -e "$legacy_libvirt_target" || $force -eq 1 ) ]]; then
+  info "Adopting existing jtarpley libvirt package.box"
+  cp --reflink=auto --sparse=always -- "$legacy_libvirt" "$legacy_libvirt_target"
+fi
+
 # Preserve already-repackaged artifacts without removing the originals.
 if [[ -d "$source_dir" && "$(cd -- "$source_dir" && pwd -P)" != "$destination_dir" ]]; then
   info "Copying existing box archives from ${source_dir}"
@@ -79,7 +89,7 @@ if [[ -d "$source_dir" && "$(cd -- "$source_dir" && pwd -P)" != "$destination_di
     if [[ ! -e "$target" || $force -eq 1 ]]; then
       cp --reflink=auto --sparse=always -- "$existing_box" "$target"
     fi
-  done < <(find "$source_dir" -type f -name '*.box' -print0)
+  done < <(find "$source_dir" -type f -name '*.box' ! -name 'package.box' -print0)
 fi
 
 mapfile -t box_lines < <(vagrant box list | sed '/^[[:space:]]*$/d')
