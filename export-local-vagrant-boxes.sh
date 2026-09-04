@@ -3,15 +3,13 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./export-local-vagrant-boxes.sh [--force] [--source DIR] [--destination DIR]
+Usage: ./export-local-vagrant-boxes.sh [--force] [--destination DIR]
 
-Exports every box reported by `vagrant box list` into a repository-local
-vagrant-boxes directory, writes SHA-256 files, and creates versioned catalogs.
+Exports every box reported by `vagrant box list` into a local box repository,
+writes SHA-256 files, and creates versioned catalogs.
 
 Options:
-  --source DIR       Copy already-exported .box files from DIR first.
-                     Default: /srv/vagrant-boxes
-  --destination DIR  Destination. Default: <repository>/vagrant-boxes
+  --destination DIR  Destination. Default: /srv/vagrant-boxes
   --force            Repackage and replace existing archives.
   -h, --help         Show this help.
 EOF
@@ -30,18 +28,11 @@ slugify() {
   printf '%s' "$1" | sed -E 's#_#-#g; s#[^[:alnum:].-]+#-#g; s#^-+##; s#-+$##'
 }
 
-repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-source_dir="/srv/vagrant-boxes"
-destination_dir="${repo_root}/vagrant-boxes"
+destination_dir="/srv/vagrant-boxes"
 force=0
 
 while (($#)); do
   case "$1" in
-    --source)
-      (($# >= 2)) || die "--source requires a directory"
-      source_dir="$2"
-      shift 2
-      ;;
     --destination)
       (($# >= 2)) || die "--destination requires a directory"
       destination_dir="$2"
@@ -68,28 +59,16 @@ done
 mkdir -p "$destination_dir" "$destination_dir/catalogs"
 destination_dir="$(cd -- "$destination_dir" && pwd -P)"
 
-info "Repository root: ${repo_root}"
-info "Box destination: ${destination_dir}"
+info "Local box repository: ${destination_dir}"
 
 # Adopt the libvirt archive created by the documented manual procedure. A
 # generic package.box has no identity, so only this known path can be mapped
 # safely without rebuilding it.
-legacy_libvirt="${source_dir}/jtarpley-ubuntu2404/package.box"
-legacy_libvirt_target="${destination_dir}/jtarpley-ubuntu2404-base-2025.11.12-libvirt-amd64.box"
+legacy_libvirt="${destination_dir}/jtarpley-ubuntu2404/package.box"
+legacy_libvirt_target="${destination_dir}/jtarpley-ubuntu2404/jtarpley-ubuntu2404-base-2025.11.12-libvirt-amd64.box"
 if [[ -s "$legacy_libvirt" && ( ! -e "$legacy_libvirt_target" || $force -eq 1 ) ]]; then
-  info "Adopting existing jtarpley libvirt package.box"
-  cp --reflink=auto --sparse=always -- "$legacy_libvirt" "$legacy_libvirt_target"
-fi
-
-# Preserve already-repackaged artifacts without removing the originals.
-if [[ -d "$source_dir" && "$(cd -- "$source_dir" && pwd -P)" != "$destination_dir" ]]; then
-  info "Copying existing box archives from ${source_dir}"
-  while IFS= read -r -d '' existing_box; do
-    target="${destination_dir}/$(basename -- "$existing_box")"
-    if [[ ! -e "$target" || $force -eq 1 ]]; then
-      cp --reflink=auto --sparse=always -- "$existing_box" "$target"
-    fi
-  done < <(find "$source_dir" -type f -name '*.box' ! -name 'package.box' -print0)
+  info "Renaming existing jtarpley libvirt package.box"
+  mv -- "$legacy_libvirt" "$legacy_libvirt_target"
 fi
 
 mapfile -t box_lines < <(vagrant box list | sed '/^[[:space:]]*$/d')
@@ -127,8 +106,10 @@ for line in "${box_lines[@]}"; do
   architecture="${BASH_REMATCH[5]:-amd64}"
 
   name_slug="$(slugify "$box_name")"
+  archive_dir="${destination_dir}/${name_slug}"
+  mkdir -p "$archive_dir"
   filename="${name_slug}-${version}-${provider}-${architecture}.box"
-  archive="${destination_dir}/${filename}"
+  archive="${archive_dir}/${filename}"
 
   if [[ -s "$archive" && $force -eq 0 ]]; then
     info "Keeping existing ${filename}"
@@ -146,8 +127,9 @@ for line in "${box_lines[@]}"; do
   tar -tf "$archive" >/dev/null || die "invalid box archive: ${archive}"
   checksum="$(sha256sum "$archive" | awk '{print $1}')"
   printf '%s  %s\n' "$checksum" "$filename" > "${archive}.sha256"
+  relative_archive="${name_slug}/${filename}"
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$box_name" "$provider" "$version" "$architecture" "$filename" "$checksum" >> "$manifest"
+    "$box_name" "$provider" "$version" "$architecture" "$relative_archive" "$checksum" >> "$manifest"
 done
 
 [[ -s "$manifest" ]] || die "no boxes were exported"
@@ -184,14 +166,14 @@ ruby -rjson -e '
 ' "$destination_dir" "$manifest"
 
 info "Verifying checksums"
-(
-  cd -- "$destination_dir"
-  while IFS= read -r checksum_file; do
+while IFS= read -r checksum_file; do
+  (
+    cd -- "$(dirname -- "$checksum_file")"
     sha256sum --check "$(basename -- "$checksum_file")"
-  done < <(find "$destination_dir" -maxdepth 1 -type f -name '*.box.sha256' | sort)
-)
+  )
+done < <(find "$destination_dir" -mindepth 2 -maxdepth 2 -type f -name '*.box.sha256' | sort)
 
 info "Export completed"
-find "$destination_dir" -maxdepth 2 -type f \
+find "$destination_dir" -maxdepth 3 -type f \
   \( -name '*.box' -o -name '*.box.sha256' -o -name '*.json' \) \
   -printf '%p\t%k KB\n' | sort
