@@ -66,9 +66,18 @@ info "Local box repository: ${destination_dir}"
 # safely without rebuilding it.
 legacy_libvirt="${destination_dir}/jtarpley-ubuntu2404/package.box"
 legacy_libvirt_target="${destination_dir}/jtarpley-ubuntu2404/jtarpley-ubuntu2404-base-2025.11.12-libvirt-amd64.box"
-if [[ -s "$legacy_libvirt" && ( ! -e "$legacy_libvirt_target" || $force -eq 1 ) ]]; then
-  info "Renaming existing jtarpley libvirt package.box"
-  mv -- "$legacy_libvirt" "$legacy_libvirt_target"
+if [[ -s "$legacy_libvirt" ]]; then
+  if [[ ! -e "$legacy_libvirt_target" ]]; then
+    info "Renaming existing jtarpley libvirt package.box"
+    mv -- "$legacy_libvirt" "$legacy_libvirt_target"
+  elif [[ "$(sha256sum "$legacy_libvirt" | awk '{print $1}')" == "$(sha256sum "$legacy_libvirt_target" | awk '{print $1}')" ]]; then
+    info "Removing duplicate jtarpley package.box"
+    rm -f -- "$legacy_libvirt"
+  else
+    legacy_conflict="${legacy_libvirt}.conflict.$(date +%s)"
+    printf 'WARNING: preserving different package.box as %s\n' "$legacy_conflict" >&2
+    mv -- "$legacy_libvirt" "$legacy_conflict"
+  fi
 fi
 
 mapfile -t box_lines < <(vagrant box list | sed '/^[[:space:]]*$/d')
@@ -151,6 +160,28 @@ for line in "${box_lines[@]}"; do
 done
 
 [[ -s "$manifest" ]] || die "no boxes were exported"
+
+# Remove legacy or manually created duplicate archives only when their content
+# exactly matches a canonical archive recorded in this run. Canonical archives
+# are never removed, even if two legitimate provider/version entries happen to
+# have identical content.
+declare -A canonical_paths=()
+declare -A canonical_checksums=()
+while IFS=$'\t' read -r _box_name _provider _version _architecture relative_archive checksum; do
+  canonical_paths["${destination_dir}/${relative_archive}"]=1
+  canonical_checksums["$checksum"]="${destination_dir}/${relative_archive}"
+done < "$manifest"
+
+info "Checking for duplicate box archives"
+while IFS= read -r -d '' candidate; do
+  [[ -n "${canonical_paths[$candidate]:-}" ]] && continue
+  candidate_checksum="$(sha256sum "$candidate" | awk '{print $1}')"
+  canonical_match="${canonical_checksums[$candidate_checksum]:-}"
+  if [[ -n "$canonical_match" ]]; then
+    info "Removing duplicate ${candidate}; canonical copy is ${canonical_match}"
+    rm -f -- "$candidate" "${candidate}.sha256"
+  fi
+done < <(find "$destination_dir" -type f -name '*.box' -print0)
 
 # Create one Vagrant catalog per logical box. Ruby is available because
 # Vagrant itself uses Ruby; using it here avoids an additional jq dependency.
